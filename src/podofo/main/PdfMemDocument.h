@@ -126,6 +126,41 @@ public:
      */
     void SaveUpdate(OutputStreamDevice& device, PdfSaveOptions opts = PdfSaveOptions::None);
 
+    /** Select and reorder pages in the document
+     *
+     *  \param pageNumbers vector of page numbers (0-based) to select and reorder
+     *                     If empty, all pages are selected in their current order
+     *                     If a page number is out of range, it will be ignored
+     *                     Duplicate page numbers are allowed and will be included
+     *
+     *  This method reorders the pages in the document according to the provided
+     *  page numbers. Pages not included in the pageNumbers vector will be removed.
+     *  The order of pages in the resulting document will match the order in pageNumbers.
+     *
+     *  \see PyMuPDF Document.select() for similar functionality
+     */
+    void Select(const std::vector<unsigned>& pageNumbers);
+
+    /** Deduplicate objects in the document
+     *
+     *  This method performs object deduplication similar to mutool clean -gggg.
+     *  It identifies duplicate objects and merges them, updating all references
+     *  to point to a single instance of each unique object.
+     *
+     *  The deduplication process:
+     *  1. Identifies objects with identical content
+     *  2. Keeps one instance of each unique object
+     *  3. Updates all references to point to the kept objects
+     *  4. Removes duplicate objects
+     *  5. Performs garbage collection to clean up unreferenced objects
+     *
+     *  \param aggressive if true, performs more aggressive deduplication including
+     *                    stream content comparison; if false, only compares object structure
+     *
+     *  \see mutool clean -gggg for similar functionality
+     */
+    void DeduplicateObjects(bool aggressive = true);
+
     /** Encrypt the document during writing.
      *
      *  \param userPassword the user password (if empty the user does not have
@@ -180,6 +215,24 @@ private:
     void reset() override;
 
     void beforeWrite(PdfSaveOptions options);
+
+    /** Get a string representation of object content for deduplication
+     *  \param obj the object to get content for
+     *  \param aggressive if true, includes stream content in comparison
+     *  \returns string representation of object content
+     */
+    std::string getObjectContent(const PdfObject& obj, bool aggressive);
+
+    /** Update all object references in the document according to replacement map
+     *  \param replacementMap map of old references to new references
+     */
+    void updateObjectReferences(const std::unordered_map<PdfReference, PdfReference>& replacementMap);
+
+    /** Recursively update object references in a single object
+     *  \param obj the object to update references in
+     *  \param replacementMap map of old references to new references
+     */
+    void updateObjectReferencesRecursive(PdfObject& obj, const std::unordered_map<PdfReference, PdfReference>& replacementMap);
 
 private:
     PdfMemDocument& operator=(const PdfMemDocument&) = delete;

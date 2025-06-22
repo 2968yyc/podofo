@@ -10,8 +10,21 @@
 #include <podofo/auxiliary/StreamDevice.h>
 #include <podofo/private/PdfWriter.h>
 #include <podofo/private/PdfParser.h>
+#include "PdfXObjectForm.h"
+#include "PdfPage.h"
+#include "PdfResources.h"
+#include "PdfContents.h"
+#include "PdfArray.h"
+#include "PdfDictionary.h"
+#include "PdfObject.h"
+#include "PdfReference.h"
+#include "PdfObjectStream.h"
 
 #include "PdfCommon.h"
+
+#include <sstream>
+#include <unordered_map>
+#include <unordered_set>
 
 using namespace std;
 using namespace PoDoFo;
@@ -247,4 +260,261 @@ void PdfMemDocument::SetPdfVersion(PdfVersion version)
 PdfVersion PdfMemDocument::GetPdfVersion() const
 {
     return m_Version;
+}
+
+void PdfMemDocument::Select(const std::vector<unsigned>& pageNumbers)
+{
+    auto& pages = this->GetPages();
+    unsigned totalPages = pages.GetCount();
+    
+    // If no page numbers provided, keep all pages in current order
+    if (pageNumbers.empty())
+        return;
+    
+    // Validate page numbers and filter out invalid ones
+    std::vector<unsigned> validPageNumbers;
+    for (unsigned pageNum : pageNumbers)
+    {
+        if (pageNum < totalPages)
+            validPageNumbers.push_back(pageNum);
+    }
+    
+    // If no valid page numbers, clear all pages
+    if (validPageNumbers.empty())
+    {
+        while (pages.GetCount() > 0)
+            pages.RemovePageAt(0);
+        return;
+    }
+    
+    // Create a temporary document to store the selected pages
+    PdfMemDocument tempDoc;
+    
+    // Copy selected pages to temporary document in the specified order
+    for (unsigned pageNum : validPageNumbers)
+    {
+        // Get the page from the original document
+        PdfPage& originalPage = pages.GetPageAt(pageNum);
+        
+        // Create a new page in the temporary document with the same size
+        PdfPage& newPage = tempDoc.GetPages().CreatePage(originalPage.GetMediaBox());
+        
+        // Copy the page content by creating an XObject from the original page
+        auto xobj = this->CreateXObjectForm(originalPage.GetMediaBox());
+        this->FillXObjectFromPage(*xobj, originalPage, false);
+        
+        // Add the XObject to the new page
+        newPage.GetResources().AddResource("XObject"_n, "Page"_n, xobj->GetObject());
+        
+        // Create a content stream that shows the XObject
+        auto& contents = newPage.GetOrCreateContents();
+        auto& stream = contents.GetOrCreateStream();
+        auto output = stream.GetOutputStream({ PdfFilterType::FlateDecode });
+        
+        // Write the content stream to display the XObject
+        std::string contentStr = "q\n";
+        contentStr += "1 0 0 1 0 0 cm\n";  // Identity matrix
+        contentStr += "/Page Do\n";         // Display the XObject
+        contentStr += "Q\n";                // Restore graphics state
+        
+        output.Write(contentStr);
+    }
+    
+    // Clear the original document's pages
+    while (pages.GetCount() > 0)
+        pages.RemovePageAt(0);
+    
+    // Copy all pages from temporary document back to original document
+    this->AppendDocumentPages(tempDoc);
+}
+
+void PdfMemDocument::DeduplicateObjects(bool aggressive)
+{
+    auto& objects = this->GetObjects();
+    
+    // Step 1: Build a map of object content to object references
+    std::unordered_map<std::string, std::vector<PdfReference>> contentMap;
+    std::unordered_map<PdfReference, std::string> objectContent;
+    
+    for (auto obj : objects)
+    {
+        if (obj == nullptr)
+            continue;
+            
+        std::string content = getObjectContent(*obj, aggressive);
+        contentMap[content].push_back(obj->GetIndirectReference());
+        objectContent[obj->GetIndirectReference()] = content;
+    }
+    
+    // Step 2: Identify duplicates and create replacement map
+    std::unordered_map<PdfReference, PdfReference> replacementMap;
+    std::unordered_set<PdfReference> objectsToRemove;
+    
+    for (const auto& pair : contentMap)
+    {
+        const auto& refs = pair.second;
+        if (refs.size() > 1)
+        {
+            // Keep the first reference, replace all others
+            PdfReference keepRef = refs[0];
+            for (size_t i = 1; i < refs.size(); i++)
+            {
+                replacementMap[refs[i]] = keepRef;
+                objectsToRemove.insert(refs[i]);
+            }
+        }
+    }
+    
+    // Step 3: Update all references in the document
+    updateObjectReferences(replacementMap);
+    
+    // Step 4: Remove duplicate objects
+    for (const auto& ref : objectsToRemove)
+    {
+        objects.RemoveObject(ref);
+    }
+    
+    // Step 5: Perform garbage collection
+    this->CollectGarbage();
+}
+
+std::string PdfMemDocument::getObjectContent(const PdfObject& obj, bool aggressive)
+{
+    std::stringstream ss;
+    
+    switch (obj.GetDataType())
+    {
+        case PdfDataType::Null:
+            ss << "null";
+            break;
+            
+        case PdfDataType::Boolean:
+            ss << "bool:" << (obj.GetBool() ? "true" : "false");
+            break;
+            
+        case PdfDataType::Number:
+            if (obj.IsNumber())
+                ss << "num:" << obj.GetNumber();
+            else
+                ss << "int:" << obj.GetInt64();
+            break;
+            
+        case PdfDataType::Real:
+            ss << "real:" << obj.GetReal();
+            break;
+            
+        case PdfDataType::String:
+            ss << "str:" << obj.GetString().GetString();
+            break;
+            
+        case PdfDataType::Name:
+            ss << "name:" << obj.GetName().GetString();
+            break;
+            
+        case PdfDataType::Array:
+        {
+            ss << "array:[";
+            const auto& arr = obj.GetArray();
+            for (size_t i = 0; i < arr.GetSize(); i++)
+            {
+                if (i > 0) ss << ",";
+                ss << getObjectContent(arr[i], aggressive);
+            }
+            ss << "]";
+            break;
+        }
+        
+        case PdfDataType::Dictionary:
+        {
+            ss << "dict:{";
+            const auto& dict = obj.GetDictionary();
+            bool first = true;
+            for (const auto& pair : dict)
+            {
+                if (!first) ss << ",";
+                ss << pair.first.GetString() << ":" << getObjectContent(pair.second, aggressive);
+                first = false;
+            }
+            ss << "}";
+            
+            // Include stream content if aggressive mode is enabled
+            if (aggressive && obj.HasStream())
+            {
+                ss << "stream:";
+                auto& stream = obj.GetOrCreateStream();
+                charbuff buffer;
+                stream.CopyTo(buffer);
+                ss << std::string(buffer.data(), buffer.size());
+            }
+            break;
+        }
+        
+        case PdfDataType::Reference:
+            // For references, we include the reference itself in the content
+            // This ensures that identical references are considered the same
+            ss << "ref:" << obj.GetReference().ObjectNumber() << ":" << obj.GetReference().GenerationNumber();
+            break;
+            
+        default:
+            ss << "unknown";
+            break;
+    }
+    
+    return ss.str();
+}
+
+void PdfMemDocument::updateObjectReferences(const std::unordered_map<PdfReference, PdfReference>& replacementMap)
+{
+    if (replacementMap.empty())
+        return;
+        
+    auto& objects = this->GetObjects();
+    
+    for (auto obj : objects)
+    {
+        if (obj == nullptr)
+            continue;
+            
+        updateObjectReferencesRecursive(*obj, replacementMap);
+    }
+}
+
+void PdfMemDocument::updateObjectReferencesRecursive(PdfObject& obj, const std::unordered_map<PdfReference, PdfReference>& replacementMap)
+{
+    switch (obj.GetDataType())
+    {
+        case PdfDataType::Reference:
+        {
+            auto it = replacementMap.find(obj.GetReference());
+            if (it != replacementMap.end())
+            {
+                obj = PdfObject(it->second);
+            }
+            break;
+        }
+        
+        case PdfDataType::Array:
+        {
+            auto& arr = obj.GetArrayUnsafe();
+            for (auto& child : arr)
+            {
+                updateObjectReferencesRecursive(child, replacementMap);
+            }
+            break;
+        }
+        
+        case PdfDataType::Dictionary:
+        {
+            auto& dict = obj.GetDictionaryUnsafe();
+            for (auto& pair : dict)
+            {
+                updateObjectReferencesRecursive(pair.second, replacementMap);
+            }
+            break;
+        }
+        
+        default:
+            // No references to update in other data types
+            break;
+    }
 }
